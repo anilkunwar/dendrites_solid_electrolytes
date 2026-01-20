@@ -4,10 +4,12 @@ import plotly.graph_objects as go
 import plotly.subplots as sp
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap
-import pyvista as pv
+from matplotlib.animation import FuncAnimation
 from io import BytesIO
 import time
 from numba import njit, prange
+import zipfile
+import base64
 
 # Constants - minimal grid for robustness
 GRID_X, GRID_Y = 64, 64
@@ -39,7 +41,7 @@ def compute_gb_indicator(eta):
     sum_eta_sq = np.zeros((GRID_X, GRID_Y))
     sum_eta_quad = np.zeros((GRID_X, GRID_Y))
     
-    for i in range(n_grains):
+    for i in prange(n_grains):
         eta_sq = eta[i]**2
         sum_eta_sq += eta_sq
         sum_eta_quad += eta_sq**2
@@ -375,32 +377,110 @@ def create_plotly_figure(eta, eta_sp, c, energy_history):
     
     return fig
 
-def export_to_pvd(eta_history, eta_sp_history, c_history, filename):
-    """Export simulation data to PVD format for ParaView"""
-    grid = pv.UniformGrid()
-    grid.dimensions = [GRID_X, GRID_Y, 1]
-    grid.origin = (0, 0, 0)
-    grid.spacing = (DX, DX, 1)
+def create_animation_frames(eta_history, eta_sp_history, c_history):
+    """Create animation frames for download as PNG sequence"""
+    frames = []
+    num_frames = len(eta_history)
     
-    # Create multiblock dataset
-    blocks = pv.MultiBlock()
+    # Create figure for animation
+    fig, axes = plt.subplots(1, 3, figsize=(15, 5))
     
-    for step in range(len(eta_history)):
-        step_grid = grid.copy()
-        
-        # Add grain fields
-        for i in range(eta_history[step].shape[0]):
-            step_grid[f"grain_{i}"] = eta_history[step][i].flatten(order='F')
-        
-        # Add substrate and concentration
-        step_grid["substrate"] = eta_sp_history[step].flatten(order='F')
-        step_grid["concentration"] = c_history[step].flatten(order='F')
-        
-        blocks[f"step_{step}"] = step_grid
+    # Grain structure colormap
+    grain_colors = ['black', '#FF4500', '#32CD32', '#1E90FF', '#FFD700']
+    grain_cmap = ListedColormap(grain_colors[:5])
     
-    # Write PVD file
-    blocks.save(filename)
-    return filename
+    for frame_idx in range(num_frames):
+        eta = eta_history[frame_idx]
+        eta_sp = eta_sp_history[frame_idx]
+        c = c_history[frame_idx]
+        
+        # Create grain visualization
+        grains = np.zeros((GRID_X, GRID_Y))
+        for i in range(GRID_X):
+            for j in range(GRID_Y):
+                if eta_sp[i, j] > 0.5:
+                    grains[i, j] = 0  # Substrate
+                else:
+                    max_idx = 0
+                    max_val = eta[0, i, j]
+                    for k in range(1, eta.shape[0]):
+                        if eta[k, i, j] > max_val:
+                            max_val = eta[k, i, j]
+                            max_idx = k
+                    grains[i, j] = max_idx + 1
+        
+        # Clear previous plots
+        for ax in axes:
+            ax.clear()
+        
+        # Plot grains with substrate
+        axes[0].imshow(grains.T, cmap=grain_cmap, origin='lower')
+        axes[0].set_title(f'Grains & Substrate (Frame {frame_idx})')
+        axes[0].set_xlabel('X')
+        axes[0].set_ylabel('Y')
+        
+        # Concentration field
+        im2 = axes[1].imshow(c.T, cmap='hot', origin='lower', vmin=0, vmax=1.5)
+        axes[1].set_title(f'Concentration Field (Frame {frame_idx})')
+        axes[1].set_xlabel('X')
+        fig.colorbar(im2, ax=axes[1])
+        
+        # Substrate phase
+        im3 = axes[2].imshow(eta_sp.T, cmap='Blues', origin='lower', vmin=0, vmax=1)
+        axes[2].set_title(f'Substrate Phase (Frame {frame_idx})')
+        axes[2].set_xlabel('X')
+        fig.colorbar(im3, ax=axes[2])
+        
+        plt.tight_layout()
+        
+        # Save to buffer
+        buf = BytesIO()
+        plt.savefig(buf, format='png', dpi=100)
+        buf.seek(0)
+        frames.append(buf.getvalue())
+        plt.close()
+    
+    return frames
+
+def create_download_zip(eta_history, eta_sp_history, c_history, energy_history):
+    """Create ZIP file containing simulation data and animation frames"""
+    zip_buffer = BytesIO()
+    
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        # Save NumPy data
+        data_dict = {
+            'eta_history.npy': eta_history,
+            'eta_sp_history.npy': eta_sp_history,
+            'c_history.npy': c_history,
+            'energy_history.npy': energy_history
+        }
+        
+        for filename, data in data_dict.items():
+            arr_bytes = BytesIO()
+            np.save(arr_bytes, data)
+            arr_bytes.seek(0)
+            zip_file.writestr(filename, arr_bytes.getvalue())
+        
+        # Create and add animation frames
+        frames = create_animation_frames(eta_history, eta_sp_history, c_history)
+        for i, frame in enumerate(frames):
+            zip_file.writestr(f"frame_{i:04d}.png", frame)
+        
+        # Add metadata
+        metadata = f"""
+Simulation Parameters:
+- Grid Size: {GRID_X}x{GRID_Y}
+- Number of Grains: 4
+- Grain Growth Steps: {STEPS_GRAIN_GROWTH}
+- Penetration Steps: {MAX_PENETRATION_STEPS}
+- Supersaturation: {c_super}
+- GB Mobility Multiplier: {M_GB}
+- Time Step: {DT}
+        """
+        zip_file.writestr("metadata.txt", metadata)
+    
+    zip_buffer.seek(0)
+    return zip_buffer
 
 # Streamlit App
 st.set_page_config(layout="wide", page_title="Intergranular Penetration Simulator")
@@ -593,71 +673,38 @@ with tab2:
         # Download section
         st.subheader("Download Results")
         
-        col1, col2 = st.columns(2)
-        
-        with col1:
-            if st.button("Export to PVD Format"):
-                with st.spinner("Generating PVD file..."):
-                    # Create temporary file
-                    pvd_filename = "intergranular_penetration.pvd"
-                    export_to_pvd(
-                        st.session_state.eta_history,
-                        st.session_state.eta_sp_history,
-                        st.session_state.c_history,
-                        pvd_filename
-                    )
-                    
-                    # Read file for download
-                    with open(pvd_filename, "rb") as f:
-                        pvd_data = f.read()
-                    
-                    st.download_button(
-                        label="Download PVD File",
-                        data=pvd_data,
-                        file_name=pvd_filename,
-                        mime="application/octet-stream"
-                    )
-        
-        with col2:
-            if st.button("Export Data (NumPy)"):
-                with st.spinner("Preparing data export..."):
-                    # Create dictionary with all data
-                    export_data = {
-                        'eta_history': np.array(st.session_state.eta_history),
-                        'eta_sp_history': np.array(st.session_state.eta_sp_history),
-                        'c_history': np.array(st.session_state.c_history),
-                        'energy_history': np.array(st.session_state.energy_history),
-                        'parameters': {
-                            'grid_size': [GRID_X, GRID_Y],
-                            'dt': DT,
-                            'steps_grain_growth': grain_growth_steps,
-                            'steps_penetration': penetration_steps,
-                            'c_super': c_super,
-                            'm_gb_mult': m_gb_mult
-                        }
-                    }
-                    
-                    # Save to bytes
-                    buf = BytesIO()
-                    np.savez_compressed(buf, **export_data)
-                    buf.seek(0)
-                    
-                    st.download_button(
-                        label="Download NumPy Data",
-                        data=buf.getvalue(),
-                        file_name="simulation_data.npz",
-                        mime="application/octet-stream"
-                    )
+        if st.button("Prepare Download Package (ZIP)"):
+            with st.spinner("Creating download package with simulation data and animation frames..."):
+                # Create ZIP file
+                zip_buffer = create_download_zip(
+                    st.session_state.eta_history,
+                    st.session_state.eta_sp_history,
+                    st.session_state.c_history,
+                    st.session_state.energy_history
+                )
+                
+                # Provide download button
+                st.download_button(
+                    label="Download Simulation Results (ZIP)",
+                    data=zip_buffer,
+                    file_name="intergranular_penetration_results.zip",
+                    mime="application/zip",
+                    help="Contains NumPy arrays of simulation data and PNG animation frames"
+                )
         
         st.info("""
-        **PVD File Usage**: 
-        - Open in ParaView (free visualization software)
-        - Load the .pvd file to see time evolution
-        - Visualize grain fields, substrate phase, and concentration
+        **Download Package Contents**:
+        - `eta_history.npy`: Grain order parameters over time
+        - `eta_sp_history.npy`: Substrate phase field over time
+        - `c_history.npy`: Concentration field over time
+        - `energy_history.npy`: Free energy evolution
+        - `frame_XXXX.png`: Animation frames (one per time step)
+        - `metadata.txt`: Simulation parameters
         
-        **NumPy Data**: 
-        - Contains all simulation data as NumPy arrays
-        - Can be loaded with: `data = np.load('simulation_data.npz')`
+        **To visualize the animation**:
+        1. Extract the ZIP file
+        2. Use the PNG sequence with any animation software (ImageJ, FFmpeg, etc.)
+        3. Or load the NumPy arrays in Python for custom visualization
         """)
     else:
         st.info("Run the simulation first to see results here.")
@@ -750,19 +797,7 @@ with tab3:
     
     # Add references
     st.subheader("Key References")
-    st.markdown("""
-    1. **Phase Field Models for Microstructure Evolution**  
-       Chen, L.-Q. (2002). *Annual Review of Materials Research*, 32, 113-140.
-       
-    2. **Grain Boundary Wetting and Penetration**  
-       Lobkovsky, A. E., & Warren, J. A. (2015). *Physical Review Materials*, 1(2), 023401.
-       
-    3. **Multi-Phase Field Modeling**  
-       Nestler, B., et al. (2005). *Physical Review E*, 71(4), 041609.
-       
-    4. **Cahn-Hilliard with Variable Mobility**  
-       Elliott, C. M., & Garcke, H. (1996). *SIAM Journal on Mathematical Analysis*, 27(2), 404-423.
-    """)
+   
 
 # Footer
 st.markdown("---")
