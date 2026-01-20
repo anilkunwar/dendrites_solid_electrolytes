@@ -30,8 +30,9 @@ DEFAULT_PARAMS = {
     'supersaturation': 0.6,     # Initial supersaturation
     'time_step': 0.01,          # Time step for integration
     'total_steps': 1000,        # Total simulation steps
-    'grain_arrangement': 'voronoi',  # Options: 'voronoi', 'random_seeds', 'regular_grid'
+    'grain_arrangement': 'voronoi',  # Options: 'voronoi', 'random_seeds', 'regular_grid', 'periodic_voronoi'
     'gb_indicator_type': 'standard', # Options: 'standard', 'gradient_based'
+    'periodic_boundaries': False,    # Whether to use periodic boundaries for Voronoi
 }
 
 # =====================
@@ -331,32 +332,93 @@ def update_concentration(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
     return new_c
 
 # =====================
-# INITIALIZATION FUNCTIONS
+# INITIALIZATION FUNCTIONS - OPTIMIZED VORONOI
 # =====================
 def create_grain_structure(nx: int, ny: int, n_grains: int, 
-                          method: str = 'voronoi', interface_width: float = 3.0) -> np.ndarray:
+                          method: str = 'voronoi', interface_width: float = 3.0,
+                          periodic: bool = False) -> np.ndarray:
     """
-    Create grain structure with specified arrangement
+    Create grain structure with specified arrangement - OPTIMIZED
     
     Args:
         nx, ny: Grid dimensions
         n_grains: Number of grains
-        method: 'voronoi', 'random_seeds', or 'regular_grid'
+        method: 'voronoi', 'periodic_voronoi', 'random_seeds', or 'regular_grid'
         interface_width: Width of diffuse interfaces
+        periodic: Whether to use periodic boundaries for Voronoi
         
     Returns:
         Order parameter fields for grains (n_grains, nx, ny)
     """
     etas = np.zeros((n_grains, nx, ny), dtype=np.float64)
     
-    if method == 'voronoi':
-        # Create Voronoi tessellation
-        seeds = np.random.rand(n_grains, 2) * [nx, ny]
-        for i in range(nx):
-            for j in range(ny):
-                distances = np.sqrt((seeds[:, 0] - i)**2 + **(seeds[:, 1] - j)2)
-                closest_grain = np.argmin(distances)
-                etas[closest_grain, i, j] = 1.0
+    if method in ['voronoi', 'periodic_voronoi']:
+        # OPTIMIZED VORONOI TESSELLATION
+        if method == 'periodic_voronoi' or periodic:
+            # Create seed points with periodic boundaries
+            seeds = np.random.rand(n_grains, 2) * [nx, ny]
+            
+            # Create coordinate grids
+            grid_x, grid_y = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
+            
+            # Initialize distance map and closest grain map
+            min_dist = np.full((nx, ny), np.inf)
+            closest_grain_map = np.zeros((nx, ny), dtype=int)
+            
+            # For each seed, calculate distances to all points
+            for k in range(n_grains):
+                seed_x, seed_y = seeds[k]
+                
+                if periodic:
+                    # Calculate minimum distance considering periodic boundaries
+                    dx = np.minimum(np.abs(grid_x - seed_x), 
+                                   np.minimum(np.abs(grid_x - seed_x + nx), 
+                                             np.abs(grid_x - seed_x - nx)))
+                    dy = np.minimum(np.abs(grid_y - seed_y), 
+                                   np.minimum(np.abs(grid_y - seed_y + ny), 
+                                             np.abs(grid_y - seed_y - ny)))
+                    dist_sq = dx**2 + dy**2
+                else:
+                    # Regular distance calculation
+                    dx = grid_x - seed_x
+                    dy = grid_y - seed_y
+                    dist_sq = dx**2 + dy**2
+                
+                # Update closest grain map where this seed is closer
+                mask = dist_sq < min_dist
+                min_dist[mask] = dist_sq[mask]
+                closest_grain_map[mask] = k
+            
+            # Fill etas array based on closest grain map
+            for k in range(n_grains):
+                etas[k, closest_grain_map == k] = 1.0
+        
+        else:
+            # Standard Voronoi without periodic boundaries
+            seeds = np.random.rand(n_grains, 2) * [nx, ny]
+            
+            # Create coordinate grids
+            grid_x, grid_y = np.meshgrid(np.arange(nx), np.arange(ny), indexing='ij')
+            
+            # Initialize distance map and closest grain map
+            min_dist = np.full((nx, ny), np.inf)
+            closest_grain_map = np.zeros((nx, ny), dtype=int)
+            
+            # For each seed, calculate distances to all points
+            for k in range(n_grains):
+                seed_x, seed_y = seeds[k]
+                dx = grid_x - seed_x
+                dy = grid_y - seed_y
+                dist_sq = dx**2 + dy**2
+                
+                # Update closest grain map where this seed is closer
+                mask = dist_sq < min_dist
+                min_dist[mask] = dist_sq[mask]
+                closest_grain_map[mask] = k
+            
+            # Fill etas array based on closest grain map
+            for k in range(n_grains):
+                etas[k, closest_grain_map == k] = 1.0
     
     elif method == 'random_seeds':
         # Place random seed points for each grain
@@ -387,22 +449,16 @@ def create_grain_structure(nx: int, ny: int, n_grains: int,
     # Apply diffuse interfaces
     if interface_width > 0:
         for k in range(n_grains):
-            # Distance transform approximation
-            for i in range(nx):
-                for j in range(ny):
-                    if etas[k, i, j] < 0.5:
-                        continue
-                    # Simple diffuse interface
-                    for di in range(-int(interface_width), int(interface_width)+1):
-                        for dj in range(-int(interface_width), int(interface_width)+1):
-                            ni = i + di
-                            nj = j + dj
-                            if 0 <= ni < nx and 0 <= nj < ny:
-                                dist = np.sqrt(di*di + dj*dj)
-                                if dist < interface_width:
-                                    weight = np.exp(-dist**2 / (2 * (interface_width/2)**2))
-                                    if etas[k, ni, nj] < weight:
-                                        etas[k, ni, nj] = weight
+            # Simple distance transform for diffuse interfaces
+            grain_mask = etas[k] > 0.5
+            if np.any(grain_mask):
+                # Calculate distance transform
+                from scipy.ndimage import distance_transform_edt
+                dist = distance_transform_edt(~grain_mask)
+                
+                # Apply smooth interface
+                interface_mask = dist < interface_width
+                etas[k][interface_mask] = np.exp(-dist[interface_mask]**2 / (2 * (interface_width/2)**2))
     
     # Normalize to ensure sum(etas) = 1 everywhere
     sum_eta = np.sum(etas, axis=0)
@@ -428,7 +484,8 @@ def initialize_fields(params: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
     n_grains = params['n_grains']
     
     # Initialize inert grains
-    etas = create_grain_structure(nx, ny, n_grains, params['grain_arrangement'], params['interface_width'])
+    etas = create_grain_structure(nx, ny, n_grains, params['grain_arrangement'], 
+                                 params['interface_width'], params['periodic_boundaries'])
     
     # Initialize substrate phase (left side)
     eta_sp = np.zeros((nx, ny), dtype=np.float64)
@@ -610,8 +667,9 @@ def visualize_initial_conditions(etas: np.ndarray, eta_sp: np.ndarray, params: D
     with col3:
         st.metric("Grid Resolution", f"{nx}×{ny}")
     
-    st.info("""
+    st.info(f"""
     **Initial Conditions Explained:**
+    - **Microstructure Type**: {params['grain_arrangement']} with {'periodic boundaries' if params['periodic_boundaries'] else 'fixed boundaries'}
     - **Composite Microstructure**: Shows both substrate phase (black) and polycrystalline grains with different colors
     - **Substrate Interpolation**: Uses standard Moelans function h(η_sp) = η_sp²(3-2η_sp) for smooth transition
     - **GB Indicator**: Highlights grain boundaries where η_i²η_j² is maximum (values close to 1)
@@ -775,9 +833,15 @@ def main():
     
     grain_arrangement = st.sidebar.selectbox(
         "Grain Arrangement", 
-        ['voronoi', 'random_seeds', 'regular_grid'],
+        ['voronoi', 'periodic_voronoi', 'random_seeds', 'regular_grid'],
         index=0,
         help="Method to arrange the inert grains"
+    )
+    
+    periodic_boundaries = st.sidebar.checkbox(
+        "Periodic Boundaries for Voronoi",
+        value=DEFAULT_PARAMS['periodic_boundaries'],
+        help="Use periodic boundaries for Voronoi tessellation (avoids edge effects)"
     )
     
     # Interface parameters
@@ -867,6 +931,7 @@ def main():
         'grain_arrangement': grain_arrangement,
         'gb_indicator_type': gb_indicator_type,
         'dx': 1.0,  # Fixed grid spacing
+        'periodic_boundaries': periodic_boundaries,
     }
     
     # Simulation control buttons
@@ -909,15 +974,37 @@ def main():
         # Interactive parameter effects
         st.subheader("Parameter Effects Preview")
         
-        st.markdown("""
-        Adjust the sidebar parameters to see how they affect the initial microstructure:
-        - **Interface Width**: Controls the smoothness of phase boundaries
-        - **Number of Grains**: Changes the complexity of the polycrystalline structure
-        - **Grain Arrangement**: Different patterns of grain distribution
-        - **GB Detection Method**: Different ways to identify grain boundaries
+        st.markdown(f"""
+        **Current Configuration:**
+        - **Grain Arrangement**: {params['grain_arrangement']}
+        - **Periodic Boundaries**: {'Enabled' if params['periodic_boundaries'] else 'Disabled'}
+        - **Number of Grains**: {params['n_grains']}
+        - **Interface Width**: {params['interface_width']} grid units
         
-        The visualization updates automatically when you change parameters.
+        **Performance Note**: The optimized Voronoi tessellation runs in O(n_grains × nx × ny) time but uses vectorized NumPy operations for much better performance than the original nested loop approach.
         """)
+        
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.markdown("**Voronoi Tessellation Performance**")
+            st.markdown("""
+            The vectorized implementation:
+            - Uses NumPy's broadcasting for distance calculations
+            - Processes all pixels simultaneously
+            - Avoids Python loops for distance computation
+            - Scales efficiently to larger grids
+            """)
+        
+        with col2:
+            st.markdown("**Periodic Boundaries**")
+            st.markdown("""
+            When enabled, periodic boundaries:
+            - Eliminate edge effects in the microstructure
+            - Create seamless grain structures across domain boundaries
+            - More accurately represent bulk material behavior
+            - Essential for simulations where boundary artifacts should be minimized
+            """)
         
         if st.button("Refresh Initial Conditions", type="secondary"):
             st.experimental_rerun()
@@ -1272,6 +1359,22 @@ def main():
         $$
         
         This function peaks at grain boundaries (where multiple $η_i$ are non-zero) and is zero within grain interiors.
+        
+        ### Voronoi Tessellation Optimization
+        
+        The optimized Voronoi tessellation implementation:
+        
+        **Standard Voronoi (non-periodic):**
+        $$
+        d_k(x,y) = \\sqrt{(x - x_k)^2 + (y - y_k)^2}
+        $$
+        
+        **Periodic Voronoi:**
+        $$
+        d_k(x,y) = \\min_{m,n \\in \\{-1,0,1\\}} \\sqrt{(x - x_k + m\\cdot L_x)^2 + (y - y_k + n\\cdot L_y)^2}
+        $$
+        
+        where $L_x$ and $L_y$ are the domain dimensions. This creates seamless grain structures across boundaries.
         """)
         
         # Parameter guide
