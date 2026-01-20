@@ -4,15 +4,12 @@ import plotly.graph_objects as go
 import plotly.subplots as sp
 import matplotlib.pyplot as plt
 from matplotlib.colors import ListedColormap, LinearSegmentedColormap
-from matplotlib.animation import FuncAnimation
 from io import BytesIO
 import time
 from numba import njit, prange
 import zipfile
 import base64
 import os
-import itertools
-from scipy.ndimage import gaussian_filter
 from typing import Tuple, Dict, List, Optional
 
 # Set default Streamlit layout
@@ -55,89 +52,96 @@ def moelans_standard_interp(eta: np.ndarray) -> np.ndarray:
     return eta * eta * (3.0 - 2.0 * eta)
 
 @njit
-def moelans_generalized_interp(eta_k: np.ndarray, etas: np.ndarray, alpha: float = 1.0) -> np.ndarray:
+def moelans_generalized_interp_point(eta_k: float, etas_at_point: np.ndarray, alpha: float = 1.0) -> float:
     """
-    Generalized Moelans interpolation function for multiple phases:
+    Generalized Moelans interpolation function for multiple phases at a single point:
     h_k = η_k² / (η_k² + α∑_{j≠k} η_j²)
     
     Args:
-        eta_k: Order parameter for phase k
-        etas: Array of all order parameters
+        eta_k: Order parameter for phase k at this point
+        etas_at_point: Array of all order parameters at this point
         alpha: Weighting parameter (default 1.0)
         
     Returns:
-        Interpolated field for phase k
+        Interpolated value for phase k at this point
     """
     numerator = eta_k * eta_k
-    denominator = numerator.copy()
+    denominator = numerator
     
-    for i in range(etas.shape[0]):
-        if i >= etas.shape[0]:
-            continue
-        denominator += alpha * etas[i] * etas[i]
+    for i in range(etas_at_point.shape[0]):
+        if i < etas_at_point.shape[0]:
+            denominator += alpha * etas_at_point[i] * etas_at_point[i]
     
-    # Avoid division by zero
-    result = np.zeros_like(numerator)
-    for i in range(numerator.shape[0]):
-        for j in range(numerator.shape[1]):
-            if denominator[i, j] > 1e-10:
-                result[i, j] = numerator[i, j] / denominator[i, j]
-            else:
-                result[i, j] = 0.0 if numerator[i, j] < 0.5 else 1.0
-                
-    return result
+    if denominator > 1e-10:
+        return numerator / denominator
+    else:
+        return 0.0 if numerator < 0.5 else 1.0
 
-@njit
-def compute_gb_indicator(etas: np.ndarray, method: str = 'standard') -> np.ndarray:
+@njit(parallel=True)
+def compute_gb_indicator(etas: np.ndarray, method: str = 'standard', n_grains: int = 0) -> np.ndarray:
     """
     Compute grain boundary indicator function
     
     Args:
         etas: Array of grain order parameters (n_grains, nx, ny)
         method: 'standard' for η_i²η_j² sum, 'gradient' for gradient-based
+        n_grains: Number of grains (explicitly passed for Numba compatibility)
         
     Returns:
         GB indicator field (0 = grain interior, 1 = grain boundary)
     """
-    n_grains, nx, ny = etas.shape
+    n_grains_calc = etas.shape[0] if n_grains == 0 else n_grains
+    nx, ny = etas.shape[1], etas.shape[2]
     gb_indicator = np.zeros((nx, ny), dtype=np.float64)
     
     if method == 'standard':
         # Standard method: sum of η_i²η_j² for all i<j
-        for i in range(n_grains):
+        for i in range(n_grains_calc):
             eta_i_sq = etas[i] * etas[i]
-            for j in range(i + 1, n_grains):
+            for j in range(i + 1, n_grains_calc):
                 eta_j_sq = etas[j] * etas[j]
-                gb_indicator += eta_i_sq * eta_j_sq
+                for x in prange(nx):
+                    for y in range(ny):
+                        gb_indicator[x, y] += eta_i_sq[x, y] * eta_j_sq[x, y]
         
         # Normalize to [0, 1]
-        max_val = 0.75 * (n_grains / 2.0)  # Theoretical maximum
-        for i in range(nx):
-            for j in range(ny):
-                if gb_indicator[i, j] > max_val:
-                    gb_indicator[i, j] = max_val
-                gb_indicator[i, j] = gb_indicator[i, j] / max_val if max_val > 0 else 0.0
+        max_val = 0.75 * (n_grains_calc / 2.0)  # Theoretical maximum
+        if max_val > 1e-10:
+            for x in prange(nx):
+                for y in range(ny):
+                    if gb_indicator[x, y] > max_val:
+                        gb_indicator[x, y] = max_val
+                    gb_indicator[x, y] = gb_indicator[x, y] / max_val
     
     elif method == 'gradient':
         # Gradient-based method: sum of |∇η_i|²
-        for i in range(n_grains):
+        for i in range(n_grains_calc):
             grad_sq = np.zeros((nx, ny))
-            for x in range(1, nx-1):
+            for x in prange(1, nx-1):
                 for y in range(1, ny-1):
                     dx = (etas[i, x+1, y] - etas[i, x-1, y]) / 2.0
                     dy = (etas[i, x, y+1] - etas[i, x, y-1]) / 2.0
                     grad_sq[x, y] = dx*dx + dy*dy
-            gb_indicator += grad_sq
+            for x in prange(nx):
+                for y in range(ny):
+                    gb_indicator[x, y] += grad_sq[x, y]
         
         # Normalize
-        max_val = np.max(gb_indicator)
+        max_val = 0.0
+        for x in range(nx):
+            for y in range(ny):
+                if gb_indicator[x, y] > max_val:
+                    max_val = gb_indicator[x, y]
+        
         if max_val > 1e-10:
-            gb_indicator = gb_indicator / max_val
+            for x in prange(nx):
+                for y in range(ny):
+                    gb_indicator[x, y] = gb_indicator[x, y] / max_val
     
     return gb_indicator
 
 # =====================
-# NUMERICAL OPERATORS
+# NUMERICAL OPERATORS - FIXED FOR NUMBA COMPATIBILITY
 # =====================
 @njit(parallel=True)
 def laplacian_2d(field: np.ndarray, dx: float = 1.0) -> np.ndarray:
@@ -174,18 +178,30 @@ def laplacian_2d(field: np.ndarray, dx: float = 1.0) -> np.ndarray:
     
     return lap
 
+# FIX: Replaced dictionary access with individual parameters for Numba compatibility
 @njit(parallel=True)
 def update_substrate(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray, 
-                    params: Dict, step: int) -> np.ndarray:
+                    kappa: float, mobility: float, gb_mobility: float, 
+                    gb_energy_bias: float, supersaturation: float,
+                    time_step: float, dx: float, step: int, 
+                    n_grains: int, gb_indicator_type: str) -> np.ndarray:
     """
-    Update substrate phase with preferential GB growth
+    Update substrate phase with preferential GB growth - FIXED FOR NUMBA
     
     Args:
         etas: Inert grain order parameters (n_grains, nx, ny)
         eta_sp: Substrate phase order parameter (nx, ny)
         c: Concentration field (nx, ny)
-        params: Simulation parameters dictionary
+        kappa: Gradient energy coefficient
+        mobility: Base mobility
+        gb_mobility: GB mobility enhancement
+        gb_energy_bias: GB energy bias strength
+        supersaturation: Initial supersaturation
+        time_step: Time step
+        dx: Grid spacing
         step: Current simulation step
+        n_grains: Number of grains
+        gb_indicator_type: GB indicator method
         
     Returns:
         Updated substrate phase field
@@ -193,12 +209,12 @@ def update_substrate(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
     nx, ny = eta_sp.shape
     new_eta_sp = np.copy(eta_sp)
     
-    # Compute GB indicator
-    gb_indicator = compute_gb_indicator(etas, params['gb_indicator_type'])
+    # Pre-compute GB indicator outside the main loop
+    gb_indicator = compute_gb_indicator(etas, gb_indicator_type, n_grains)
     
     # Compute time-dependent GB bias strength (ramp up over first 10% of simulation)
-    max_steps = params['total_steps']
-    bias_strength = params['gb_energy_bias'] * min(1.0, step / max(1, 0.1 * max_steps))
+    max_steps = 1000  # Fixed maximum for normalization
+    bias_strength = gb_energy_bias * min(1.0, step / max(1, 0.1 * max_steps))
     
     for i in prange(nx):
         for j in range(ny):
@@ -211,7 +227,7 @@ def update_substrate(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
                 continue
             
             # Chemical driving force (simplified)
-            chem_force = params['supersaturation'] - c[i, j]
+            chem_force = supersaturation - c[i, j]
             
             # GB preference term
             gb_force = bias_strength * gb_indicator[i, j]
@@ -223,18 +239,18 @@ def update_substrate(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
             jp1 = (j + 1) % ny
             jm1 = (j - 1 + ny) % ny
             lap_eta_sp = (eta_sp[i+1, j] + eta_sp[i-1, j] + 
-                         eta_sp[i, jp1] + eta_sp[i, jm1] - 4 * eta_sp[i, j]) / params['dx']**2
+                         eta_sp[i, jp1] + eta_sp[i, jm1] - 4 * eta_sp[i, j]) / dx**2
             
             # Update equation: ∂η_sp/∂t = M(Δη_sp - dF/dη_sp)
             # Simplified free energy derivative
             dF_deta = eta_sp[i, j] * (eta_sp[i, j] - 1.0) * (eta_sp[i, j] - 0.5)  # Double well
             
             # Mobility field (GB enhanced)
-            mobility_local = params['mobility'] * (1.0 + params['gb_mobility'] * gb_indicator[i, j])
+            mobility_local = mobility * (1.0 + gb_mobility * gb_indicator[i, j])
             
             # Euler integration
-            new_val = eta_sp[i, j] + params['time_step'] * mobility_local * (
-                params['kappa'] * lap_eta_sp - dF_deta + driving_force
+            new_val = eta_sp[i, j] + time_step * mobility_local * (
+                kappa * lap_eta_sp - dF_deta + driving_force
             )
             
             # Stabilize
@@ -249,15 +265,22 @@ def update_substrate(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
 
 @njit(parallel=True)
 def update_concentration(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray, 
-                        params: Dict) -> np.ndarray:
+                        mobility: float, gb_mobility: float, time_step: float, dx: float,
+                        supersaturation: float, n_grains: int, gb_indicator_type: str) -> np.ndarray:
     """
-    Update concentration field with GB-enhanced diffusion
+    Update concentration field with GB-enhanced diffusion - FIXED FOR NUMBA
     
     Args:
         etas: Inert grain order parameters
         eta_sp: Substrate phase order parameter
         c: Current concentration field
-        params: Simulation parameters
+        mobility: Base mobility
+        gb_mobility: GB mobility enhancement
+        time_step: Time step
+        dx: Grid spacing
+        supersaturation: Far-field concentration
+        n_grains: Number of grains
+        gb_indicator_type: GB indicator method
         
     Returns:
         Updated concentration field
@@ -266,7 +289,7 @@ def update_concentration(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
     new_c = np.copy(c)
     
     # Compute GB indicator for mobility enhancement
-    gb_indicator = compute_gb_indicator(etas, params['gb_indicator_type'])
+    gb_indicator = compute_gb_indicator(etas, gb_indicator_type, n_grains)
     
     for i in prange(nx):
         for j in range(ny):
@@ -275,27 +298,27 @@ def update_concentration(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
                 new_c[i, j] = 1.0  # Fixed concentration at substrate boundary
                 continue
             elif i == nx - 1:
-                new_c[i, j] = params['supersaturation']  # Fixed at far field
+                new_c[i, j] = supersaturation  # Fixed at far field
                 continue
             
             jp1 = (j + 1) % ny
             jm1 = (j - 1 + ny) % ny
             
             # Mobility at this point (GB enhanced)
-            mobility_local = params['mobility'] * (1.0 + params['gb_mobility'] * gb_indicator[i, j])
+            mobility_local = mobility * (1.0 + gb_mobility * gb_indicator[i, j])
             
             # Concentration gradient
-            dc_dx_pos = (c[i+1, j] - c[i, j]) / params['dx']
-            dc_dx_neg = (c[i, j] - c[i-1, j]) / params['dx']
-            dc_dy_pos = (c[i, jp1] - c[i, j]) / params['dx']
-            dc_dy_neg = (c[i, j] - c[i, jm1]) / params['dx']
+            dc_dx_pos = (c[i+1, j] - c[i, j]) / dx
+            dc_dx_neg = (c[i, j] - c[i-1, j]) / dx
+            dc_dy_pos = (c[i, jp1] - c[i, j]) / dx
+            dc_dy_neg = (c[i, j] - c[i, jm1]) / dx
             
             # Flux divergence
             div_flux = (mobility_local * (dc_dx_pos - dc_dx_neg) + 
-                       mobility_local * (dc_dy_pos - dc_dy_neg)) / params['dx']
+                       mobility_local * (dc_dy_pos - dc_dy_neg)) / dx
             
             # Update concentration
-            new_val = c[i, j] - params['time_step'] * div_flux
+            new_val = c[i, j] - time_step * div_flux
             
             # Stabilize
             if new_val < 0.0:
@@ -311,7 +334,7 @@ def update_concentration(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray,
 # INITIALIZATION FUNCTIONS
 # =====================
 def create_grain_structure(nx: int, ny: int, n_grains: int, 
-                          method: str = 'voronoi') -> np.ndarray:
+                          method: str = 'voronoi', interface_width: float = 3.0) -> np.ndarray:
     """
     Create grain structure with specified arrangement
     
@@ -319,6 +342,7 @@ def create_grain_structure(nx: int, ny: int, n_grains: int,
         nx, ny: Grid dimensions
         n_grains: Number of grains
         method: 'voronoi', 'random_seeds', or 'regular_grid'
+        interface_width: Width of diffuse interfaces
         
     Returns:
         Order parameter fields for grains (n_grains, nx, ny)
@@ -330,7 +354,7 @@ def create_grain_structure(nx: int, ny: int, n_grains: int,
         seeds = np.random.rand(n_grains, 2) * [nx, ny]
         for i in range(nx):
             for j in range(ny):
-                distances = np.sqrt((seeds[:, 0] - i)**2 + (seeds[:, 1] - j)**2)
+                distances = np.sqrt((seeds[:, 0] - i)**2 + **(seeds[:, 1] - j)2)
                 closest_grain = np.argmin(distances)
                 etas[closest_grain, i, j] = 1.0
     
@@ -361,24 +385,24 @@ def create_grain_structure(nx: int, ny: int, n_grains: int,
                     grain_idx += 1
     
     # Apply diffuse interfaces
-    interface_width = DEFAULT_PARAMS['interface_width']
-    for k in range(n_grains):
-        # Distance transform approximation
-        for i in range(nx):
-            for j in range(ny):
-                if etas[k, i, j] < 0.5:
-                    continue
-                # Simple diffuse interface
-                for di in range(-int(interface_width), int(interface_width)+1):
-                    for dj in range(-int(interface_width), int(interface_width)+1):
-                        ni = i + di
-                        nj = j + dj
-                        if 0 <= ni < nx and 0 <= nj < ny:
-                            dist = np.sqrt(di*di + dj*dj)
-                            if dist < interface_width:
-                                weight = np.exp(-dist**2 / (2 * (interface_width/2)**2))
-                                if etas[k, ni, nj] < weight:
-                                    etas[k, ni, nj] = weight
+    if interface_width > 0:
+        for k in range(n_grains):
+            # Distance transform approximation
+            for i in range(nx):
+                for j in range(ny):
+                    if etas[k, i, j] < 0.5:
+                        continue
+                    # Simple diffuse interface
+                    for di in range(-int(interface_width), int(interface_width)+1):
+                        for dj in range(-int(interface_width), int(interface_width)+1):
+                            ni = i + di
+                            nj = j + dj
+                            if 0 <= ni < nx and 0 <= nj < ny:
+                                dist = np.sqrt(di*di + dj*dj)
+                                if dist < interface_width:
+                                    weight = np.exp(-dist**2 / (2 * (interface_width/2)**2))
+                                    if etas[k, ni, nj] < weight:
+                                        etas[k, ni, nj] = weight
     
     # Normalize to ensure sum(etas) = 1 everywhere
     sum_eta = np.sum(etas, axis=0)
@@ -404,7 +428,7 @@ def initialize_fields(params: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
     n_grains = params['n_grains']
     
     # Initialize inert grains
-    etas = create_grain_structure(nx, ny, n_grains, params['grain_arrangement'])
+    etas = create_grain_structure(nx, ny, n_grains, params['grain_arrangement'], params['interface_width'])
     
     # Initialize substrate phase (left side)
     eta_sp = np.zeros((nx, ny), dtype=np.float64)
@@ -418,67 +442,186 @@ def initialize_fields(params: Dict) -> Tuple[np.ndarray, np.ndarray, np.ndarray]
     return etas, eta_sp, c
 
 # =====================
-# VISUALIZATION FUNCTIONS
+# VISUALIZATION FUNCTIONS - ENHANCED FOR COMPOSITE VIEW
 # =====================
-def create_microstructure_plot(etas: np.ndarray, eta_sp: np.ndarray, 
-                              show_grains: bool = True, show_substrate: bool = True) -> plt.Figure:
+def create_composite_microstructure(etas: np.ndarray, eta_sp: np.ndarray, 
+                                   show_interpolation: bool = True) -> Tuple[np.ndarray, np.ndarray]:
     """
-    Create microstructure visualization
+    Create composite microstructure visualization combining both interpolation functions
     
     Args:
-        etas: Grain order parameters
-        eta_sp: Substrate phase
-        show_grains: Whether to show grains
-        show_substrate: Whether to show substrate
+        etas: Grain order parameters (n_grains, nx, ny)
+        eta_sp: Substrate phase (nx, ny)
+        show_interpolation: Whether to apply Moelans interpolation
         
     Returns:
-        Matplotlib figure
+        composite_grain: Composite grain field (showing both substrate and matrix)
+        grain_ids: Grain ID field for coloring
     """
     n_grains, nx, ny = etas.shape
     
-    # Create grain coloring
+    # Create grain IDs (0 = substrate, 1+ = grain numbers)
     grain_ids = np.zeros((nx, ny), dtype=int)
+    
+    # Create composite field combining substrate and grains
+    composite_grain = np.zeros((nx, ny))
+    
+    # Substrate interpolation function
+    h_sp = moelans_standard_interp(eta_sp) if show_interpolation else eta_sp
+    
     for i in range(nx):
         for j in range(ny):
-            if show_substrate and eta_sp[i, j] > 0.5:
-                grain_ids[i, j] = -1  # Substrate marker
-            else:
+            if h_sp[i, j] > 0.5:  # Substrate region
+                grain_ids[i, j] = 0
+                composite_grain[i, j] = 0.0  # Substrate value
+            else:  # Matrix region with grains
+                # Find dominant grain
                 max_idx = 0
                 max_val = etas[0, i, j]
                 for k in range(1, n_grains):
                     if etas[k, i, j] > max_val:
                         max_val = etas[k, i, j]
                         max_idx = k
-                grain_ids[i, j] = max_idx
+                
+                grain_ids[i, j] = max_idx + 1
+                
+                # Apply generalized interpolation for grains
+                if show_interpolation:
+                    etas_at_point = np.zeros(n_grains)
+                    for k in range(n_grains):
+                        etas_at_point[k] = etas[k, i, j]
+                    composite_grain[i, j] = moelans_generalized_interp_point(etas[max_idx, i, j], etas_at_point)
+                else:
+                    composite_grain[i, j] = max_val
     
-    # Create colormap
-    colors = plt.cm.tab20(np.linspace(0, 1, max(20, n_grains + 1)))
-    grain_colors = [(0.0, 0.0, 0.0, 1.0)]  # Black for substrate
-    for i in range(n_grains):
-        grain_colors.append(tuple(colors[i % 20]))
+    return composite_grain, grain_ids
+
+def visualize_initial_conditions(etas: np.ndarray, eta_sp: np.ndarray, params: Dict):
+    """
+    Create comprehensive visualization of initial conditions showing both phases
     
-    cmap = ListedColormap(grain_colors)
+    Args:
+        etas: Grain order parameters
+        eta_sp: Substrate phase
+        params: Simulation parameters
+    """
+    n_grains, nx, ny = etas.shape
     
-    # Create figure
-    fig, ax = plt.subplots(figsize=(10, 8))
+    # Create composite microstructure
+    composite_grain, grain_ids = create_composite_microstructure(etas, eta_sp, show_interpolation=True)
     
-    # Plot microstructure
-    im = ax.imshow(grain_ids.T, cmap=cmap, origin='lower', interpolation='nearest')
+    # Create figure with multiple subplots
+    fig = plt.figure(figsize=(15, 12))
     
-    # Add colorbar with labels
-    cbar = plt.colorbar(im, ax=ax, ticks=range(-1, n_grains))
-    cbar_labels = ['Substrate'] + [f'Grain {i+1}' for i in range(n_grains)]
-    cbar.ax.set_yticklabels(cbar_labels)
+    # 1. Composite microstructure with interpolation
+    ax1 = fig.add_subplot(221)
+    grain_colors = ['black'] + [plt.cm.tab20(i) for i in range(n_grains)]
+    grain_cmap = ListedColormap(grain_colors[:n_grains+1])
     
-    ax.set_title('Microstructure with Substrate Phase')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
+    im1 = ax1.imshow(grain_ids.T, cmap=grain_cmap, origin='lower', interpolation='nearest')
+    ax1.set_title('Initial Microstructure (Composite View)')
+    ax1.set_xlabel('X')
+    ax1.set_ylabel('Y')
+    plt.colorbar(im1, ax=ax1, ticks=range(n_grains+1), 
+                label='Phase: 0=Substrate, 1+=Grains')
+    
+    # 2. Substrate phase with interpolation
+    ax2 = fig.add_subplot(222)
+    h_sp = moelans_standard_interp(eta_sp)
+    im2 = ax2.imshow(h_sp.T, cmap='Blues', origin='lower', vmin=0, vmax=1)
+    ax2.set_title('Substrate Interpolation Function h(η_sp)')
+    ax2.set_xlabel('X')
+    ax2.set_ylabel('Y')
+    plt.colorbar(im2, ax=ax2, label='h(η_sp)')
+    
+    # 3. GB indicator
+    ax3 = fig.add_subplot(223)
+    gb_indicator = compute_gb_indicator(etas, params['gb_indicator_type'], params['n_grains'])
+    im3 = ax3.imshow(gb_indicator.T, cmap='viridis', origin='lower', vmin=0, vmax=1)
+    ax3.set_title('Initial Grain Boundary Indicator')
+    ax3.set_xlabel('X')
+    ax3.set_ylabel('Y')
+    plt.colorbar(im3, ax=ax3, label='GB Indicator')
+    
+    # 4. Concentration field preview
+    ax4 = fig.add_subplot(224)
+    c_preview = np.full((nx, ny), params['supersaturation'])
+    substrate_width = max(1, int(0.1 * nx))
+    c_preview[:substrate_width, :] = 1.0
+    im4 = ax4.imshow(c_preview.T, cmap='hot', origin='lower', vmin=0, vmax=1.5)
+    ax4.set_title('Initial Concentration Field')
+    ax4.set_xlabel('X')
+    ax4.set_ylabel('Y')
+    plt.colorbar(im4, ax=ax4, label='Concentration')
     
     plt.tight_layout()
-    return fig
+    st.pyplot(fig)
+    
+    # Create separate figure for interpolation functions
+    fig2 = plt.figure(figsize=(12, 8))
+    
+    # Plot standard interpolation function
+    ax5 = fig2.add_subplot(121)
+    eta_vals = np.linspace(0, 1, 100)
+    h_vals = eta_vals**2 * (3 - 2*eta_vals)
+    ax5.plot(eta_vals, h_vals, 'b-', linewidth=3, label='h(η) = η²(3-2η)')
+    ax5.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='Reference')
+    ax5.set_xlabel('η', fontsize=12)
+    ax5.set_ylabel('h(η)', fontsize=12)
+    ax5.set_title('Standard Moelans Interpolation', fontsize=14)
+    ax5.grid(True, alpha=0.3)
+    ax5.legend()
+    
+    # Plot generalized interpolation example
+    ax6 = fig2.add_subplot(122)
+    n_points = 50
+    eta1_vals = np.linspace(0, 1, n_points)
+    eta2_vals = np.linspace(0, 1, n_points)
+    h_matrix = np.zeros((n_points, n_points))
+    
+    for i, e1 in enumerate(eta1_vals):
+        for j, e2 in enumerate(eta2_vals):
+            etas_at_point = np.array([e1, e2])
+            h_matrix[i, j] = moelans_generalized_interp_point(e1, etas_at_point, alpha=1.0)
+    
+    im6 = ax6.imshow(h_matrix.T, extent=[0, 1, 0, 1], origin='lower', 
+                    cmap='viridis', aspect='equal')
+    ax6.set_xlabel('η₁', fontsize=12)
+    ax6.set_ylabel('η₂', fontsize=12)
+    ax6.set_title('Generalized Interpolation (2 phases)', fontsize=14)
+    plt.colorbar(im6, ax=ax6, label='h₁')
+    
+    plt.tight_layout()
+    st.pyplot(fig2)
+    
+    # Summary statistics
+    st.subheader("Initial Conditions Summary")
+    
+    col1, col2, col3 = st.columns(3)
+    
+    with col1:
+        substrate_area = np.sum(eta_sp > 0.5) / (nx * ny) * 100
+        st.metric("Substrate Area", f"{substrate_area:.1f}%")
+    
+    with col2:
+        avg_gb_indicator = np.mean(gb_indicator)
+        st.metric("Average GB Indicator", f"{avg_gb_indicator:.3f}")
+    
+    with col3:
+        st.metric("Grid Resolution", f"{nx}×{ny}")
+    
+    st.info("""
+    **Initial Conditions Explained:**
+    - **Composite Microstructure**: Shows both substrate phase (black) and polycrystalline grains with different colors
+    - **Substrate Interpolation**: Uses standard Moelans function h(η_sp) = η_sp²(3-2η_sp) for smooth transition
+    - **GB Indicator**: Highlights grain boundaries where η_i²η_j² is maximum (values close to 1)
+    - **Concentration**: Shows initial supersaturation driving force (c > equilibrium in matrix)
+    
+    The simulation will evolve the substrate phase while keeping grains inert, with preferential growth along grain boundaries.
+    """)
 
 def create_field_visualization(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarray, 
-                             energy_history: List[float], step: int) -> go.Figure:
+                             energy_history: List[float], step: int, params: Dict) -> go.Figure:
     """
     Create Plotly visualization of all fields
     
@@ -488,6 +631,7 @@ def create_field_visualization(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarr
         c: Concentration field
         energy_history: Energy evolution history
         step: Current simulation step
+        params: Simulation parameters
         
     Returns:
         Plotly figure
@@ -498,8 +642,8 @@ def create_field_visualization(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarr
     fig = sp.make_subplots(
         rows=2, cols=3,
         subplot_titles=(
-            'Grains & Substrate', f'Substrate Phase (Step {step})', 'Concentration Field',
-            'GB Indicator', 'Chemical Potential', 'Free Energy'
+            f'Microstructure (Step {step})', 'Substrate Phase', 'Concentration Field',
+            'GB Indicator', 'Composite Field', 'Free Energy'
         ),
         specs=[
             [{"type": "heatmap"}, {"type": "heatmap"}, {"type": "heatmap"}],
@@ -507,20 +651,8 @@ def create_field_visualization(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarr
         ]
     )
     
-    # 1. Grains & Substrate
-    grain_ids = np.zeros((nx, ny), dtype=int)
-    for i in range(nx):
-        for j in range(ny):
-            if eta_sp[i, j] > 0.5:
-                grain_ids[i, j] = -1  # Substrate
-            else:
-                max_idx = 0
-                max_val = etas[0, i, j]
-                for k in range(1, n_grains):
-                    if etas[k, i, j] > max_val:
-                        max_val = etas[k, i, j]
-                        max_idx = k
-                grain_ids[i, j] = max_idx
+    # 1. Composite Microstructure
+    composite_grain, grain_ids = create_composite_microstructure(etas, eta_sp, show_interpolation=True)
     
     # Custom colormap for grains
     grain_colors = ['black'] + [f'rgb({int(255*i/n_grains)}, {int(255*(1-i/n_grains))}, {int(128)})' 
@@ -564,7 +696,7 @@ def create_field_visualization(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarr
     )
     
     # 4. GB Indicator
-    gb_indicator = compute_gb_indicator(etas)
+    gb_indicator = compute_gb_indicator(etas, params['gb_indicator_type'], params['n_grains'])
     fig.add_trace(
         go.Heatmap(
             z=gb_indicator.T,
@@ -577,16 +709,15 @@ def create_field_visualization(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarr
         row=2, col=1
     )
     
-    # 5. Chemical Potential (simplified)
-    chem_pot = c - 0.5  # Simplified for visualization
+    # 5. Composite Field (interpolated)
     fig.add_trace(
         go.Heatmap(
-            z=chem_pot.T,
-            colorscale='RdBu',
-            zmin=-1,
+            z=composite_grain.T,
+            colorscale='Plasma',
+            zmin=0,
             zmax=1,
             showscale=True,
-            name='Chem Pot'
+            name='Composite Field'
         ),
         row=2, col=2
     )
@@ -616,83 +747,6 @@ def create_field_visualization(etas: np.ndarray, eta_sp: np.ndarray, c: np.ndarr
     fig.update_xaxes(title_text="X", row=2, col=3)
     fig.update_yaxes(title_text="Energy", row=2, col=3)
     
-    return fig
-
-def create_interpolation_visualization(etas: np.ndarray, eta_sp: np.ndarray) -> plt.Figure:
-    """
-    Visualize Moelans interpolation functions
-    
-    Args:
-        etas: Grain order parameters
-        eta_sp: Substrate phase
-        
-    Returns:
-        Matplotlib figure
-    """
-    n_grains, nx, ny = etas.shape
-    
-    # Create figure with subplots
-    fig, axes = plt.subplots(2, 3, figsize=(15, 10))
-    axes = axes.ravel()
-    
-    # 1. Substrate interpolation function
-    h_sp = moelans_standard_interp(eta_sp)
-    im0 = axes[0].imshow(h_sp.T, cmap='viridis', origin='lower')
-    axes[0].set_title('Substrate Interpolation h(η_sp)')
-    plt.colorbar(im0, ax=axes[0])
-    
-    # 2-4. First three grain interpolation functions
-    for i in range(min(3, n_grains)):
-        h_grain = np.zeros((nx, ny))
-        for x in range(nx):
-            for y in range(ny):
-                # Extract all etas at this point
-                etas_at_point = np.zeros(n_grains)
-                for k in range(n_grains):
-                    etas_at_point[k] = etas[k, x, y]
-                # Compute generalized interpolation
-                h_grain[x, y] = moelans_generalized_interp(etas[i, x, y], etas_at_point)
-        
-        im = axes[i+1].imshow(h_grain.T, cmap='plasma', origin='lower')
-        axes[i+1].set_title(f'Grain {i+1} Interpolation h_{i+1}')
-        plt.colorbar(im, ax=axes[i+1])
-    
-    # 5. Sum of all grain interpolations
-    sum_h = np.zeros((nx, ny))
-    for i in range(n_grains):
-        for x in range(nx):
-            for y in range(ny):
-                etas_at_point = np.zeros(n_grains)
-                for k in range(n_grains):
-                    etas_at_point[k] = etas[k, x, y]
-                sum_h[x, y] += moelans_generalized_interp(etas[i, x, y], etas_at_point)
-    
-    im4 = axes[4].imshow(sum_h.T, cmap='coolwarm', origin='lower', vmin=0, vmax=1.1)
-    axes[4].set_title('Sum of Grain Interpolations')
-    plt.colorbar(im4, ax=axes[4])
-    
-    # 6. Combined view
-    combined = np.zeros((nx, ny))
-    for x in range(nx):
-        for y in range(ny):
-            if eta_sp[x, y] > 0.5:
-                combined[x, y] = 0  # Substrate
-            else:
-                max_idx = 0
-                max_val = etas[0, x, y]
-                for k in range(1, n_grains):
-                    if etas[k, x, y] > max_val:
-                        max_val = etas[k, x, y]
-                        max_idx = k
-                combined[x, y] = max_idx + 1
-    
-    grain_colors = ['black'] + [plt.cm.tab20(i) for i in range(n_grains)]
-    grain_cmap = ListedColormap(grain_colors[:n_grains+1])
-    im5 = axes[5].imshow(combined.T, cmap=grain_cmap, origin='lower')
-    axes[5].set_title('Combined Microstructure')
-    plt.colorbar(im5, ax=axes[5])
-    
-    plt.tight_layout()
     return fig
 
 # =====================
@@ -825,14 +879,53 @@ def main():
         reset_sim = st.button("Reset")
     
     # Main content tabs
-    tab1, tab2, tab3, tab4, tab5 = st.tabs([
-        "Simulation", "Microstructure", "Interpolation Functions", "Results", "Theory"
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "Initial Conditions", "Simulation", "Results", "Theory"
     ])
+    
+    # =====================
+    # INITIAL CONDITIONS TAB
+    # =====================
+    with tab1:
+        st.header("Initial Microstructure and Interpolation Functions")
+        
+        st.markdown("""
+        This tab shows the initial conditions of the simulation, including:
+        - **Composite microstructure** showing both substrate phase and polycrystalline grains
+        - **Moelans interpolation functions** for both substrate and grain phases
+        - **Grain boundary indicator** highlighting preferential growth paths
+        - **Initial concentration field** showing the driving force for penetration
+        
+        The composite view combines both interpolation functions to show the complete initial state.
+        """)
+        
+        # Generate and show initial conditions
+        with st.spinner("Generating initial microstructure..."):
+            etas_init, eta_sp_init, _ = initialize_fields(params)
+            
+            # Show comprehensive initial conditions visualization
+            visualize_initial_conditions(etas_init, eta_sp_init, params)
+        
+        # Interactive parameter effects
+        st.subheader("Parameter Effects Preview")
+        
+        st.markdown("""
+        Adjust the sidebar parameters to see how they affect the initial microstructure:
+        - **Interface Width**: Controls the smoothness of phase boundaries
+        - **Number of Grains**: Changes the complexity of the polycrystalline structure
+        - **Grain Arrangement**: Different patterns of grain distribution
+        - **GB Detection Method**: Different ways to identify grain boundaries
+        
+        The visualization updates automatically when you change parameters.
+        """)
+        
+        if st.button("Refresh Initial Conditions", type="secondary"):
+            st.experimental_rerun()
     
     # =====================
     # SIMULATION TAB
     # =====================
-    with tab1:
+    with tab2:
         st.header("Real-time Simulation")
         
         if run_sim or 'simulation_running' in st.session_state:
@@ -850,20 +943,29 @@ def main():
                 st.session_state.field_history = {
                     'etas': [], 'eta_sp': [], 'c': [], 'gb_indicator': [], 'step_indices': []
                 }
+                st.info("✅ Simulation initialized successfully!")
             
-            # Simulation controls
+            # Show current state
+            st.subheader("Current Simulation State")
+            
             col1, col2 = st.columns([3, 1])
             with col1:
+                plot_placeholder = st.empty()
+            with col2:
                 progress_bar = st.progress(0)
                 status_text = st.empty()
-                plot_placeholder = st.empty()
+                st.metric("Current Step", st.session_state.current_step)
+                st.metric("Grid Size", f"{params['grid_size']}×{params['grid_size']}")
             
-            with col2:
-                st.subheader("Controls")
+            # Simulation controls
+            st.subheader("Simulation Controls")
+            col1, col2, col3 = st.columns(3)
+            with col1:
                 vis_step_freq = st.slider("Visualization Frequency", 1, 100, 10)
+            with col2:
                 save_step_freq = st.slider("Save Frequency", 1, 200, 50)
-                show_gb_indicator = st.checkbox("Show GB Indicator", True)
-                show_energy = st.checkbox("Show Energy", True)
+            with col3:
+                st.write("Paused" if pause_sim else "Running")
             
             # Run simulation
             start_time = time.time()
@@ -874,20 +976,34 @@ def main():
                     st.session_state.current_step = step
                     break
                 
-                # Update fields
+                # Update fields - FIXED CALL WITH INDIVIDUAL PARAMETERS
                 st.session_state.eta_sp = update_substrate(
                     st.session_state.etas, 
                     st.session_state.eta_sp, 
                     st.session_state.c,
-                    params,
-                    step
+                    params['kappa'],
+                    params['mobility'],
+                    params['gb_mobility'],
+                    params['gb_energy_bias'],
+                    params['supersaturation'],
+                    params['time_step'],
+                    params['dx'],
+                    step,
+                    params['n_grains'],
+                    params['gb_indicator_type']
                 )
                 
                 st.session_state.c = update_concentration(
                     st.session_state.etas,
                     st.session_state.eta_sp,
                     st.session_state.c,
-                    params
+                    params['mobility'],
+                    params['gb_mobility'],
+                    params['time_step'],
+                    params['dx'],
+                    params['supersaturation'],
+                    params['n_grains'],
+                    params['gb_indicator_type']
                 )
                 
                 # Calculate energy (simplified)
@@ -895,31 +1011,32 @@ def main():
                 st.session_state.energy_history.append(energy)
                 
                 # Save fields for visualization and export
+                if step % save_step_freq == 0 or step == total_steps - 1:
+                    st.session_state.field_history['etas'].append(np.copy(st.session_state.etas))
+                    st.session_state.field_history['eta_sp'].append(np.copy(st.session_state.eta_sp))
+                    st.session_state.field_history['c'].append(np.copy(st.session_state.c))
+                    gb_ind = compute_gb_indicator(st.session_state.etas, params['gb_indicator_type'], params['n_grains'])
+                    st.session_state.field_history['gb_indicator'].append(gb_ind)
+                    st.session_state.field_history['step_indices'].append(step)
+                
+                # Update visualization
                 if step % vis_step_freq == 0 or step == total_steps - 1:
                     fig = create_field_visualization(
                         st.session_state.etas,
                         st.session_state.eta_sp,
                         st.session_state.c,
                         st.session_state.energy_history,
-                        step
+                        step,
+                        params
                     )
                     plot_placeholder.plotly_chart(fig, use_container_width=True)
-                
-                if step % save_step_freq == 0 or step == total_steps - 1:
-                    st.session_state.field_history['etas'].append(np.copy(st.session_state.etas))
-                    st.session_state.field_history['eta_sp'].append(np.copy(st.session_state.eta_sp))
-                    st.session_state.field_history['c'].append(np.copy(st.session_state.c))
-                    st.session_state.field_history['gb_indicator'].append(
-                        compute_gb_indicator(st.session_state.etas, params['gb_indicator_type'])
-                    )
-                    st.session_state.field_history['step_indices'].append(step)
                 
                 # Update progress
                 progress = (step + 1) / total_steps
                 progress_bar.progress(progress)
                 elapsed_time = time.time() - start_time
-                estimated_total = elapsed_time / (step + 1) * total_steps
-                remaining_time = estimated_total - elapsed_time
+                estimated_total = elapsed_time / (step + 1) * total_steps if step > 0 else 0
+                remaining_time = max(0, estimated_total - elapsed_time)
                 status_text.text(
                     f"Step {step+1}/{total_steps} | "
                     f"Time: {elapsed_time:.1f}s | "
@@ -936,51 +1053,33 @@ def main():
         else:
             st.info("👆 Configure parameters in the sidebar and click 'Run Simulation' to start")
             
-            # Show initial microstructure preview
-            st.subheader("Initial Microstructure Preview")
+            # Show initial conditions preview
             with st.spinner("Generating preview..."):
-                etas_init, eta_sp_init, c_init = initialize_fields(params)
-                fig_preview = create_microstructure_plot(etas_init, eta_sp_init)
+                etas_init, eta_sp_init, _ = initialize_fields(params)
+                fig_preview = plt.figure(figsize=(10, 8))
+                composite_grain, grain_ids = create_composite_microstructure(etas_init, eta_sp_init)
+                
+                grain_colors = ['black'] + [plt.cm.tab20(i) for i in range(params['n_grains'])]
+                grain_cmap = ListedColormap(grain_colors[:params['n_grains']+1])
+                
+                ax = fig_preview.add_subplot(111)
+                im = ax.imshow(grain_ids.T, cmap=grain_cmap, origin='lower')
+                ax.set_title('Initial Microstructure Preview')
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                plt.colorbar(im, ax=ax, label='Phase ID')
+                plt.tight_layout()
                 st.pyplot(fig_preview)
-            
-            # Show Moelans interpolation preview
-            st.subheader("Moelans Interpolation Functions")
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("""
-                **Standard Interpolation:**
-                $h(η) = η^2(3 - 2η)$
-                
-                This function has the properties:
-                - $h(0) = 0$, $h(1) = 1$
-                - $h'(0) = h'(1) = 0$ (zero derivatives at bounds)
-                - Monotonic between 0 and 1
-                """)
-            
-            with col2:
-                # Plot the standard interpolation function
-                eta_vals = np.linspace(0, 1, 100)
-                h_vals = eta_vals**2 * (3 - 2*eta_vals)
-                
-                fig_interp, ax = plt.subplots(figsize=(6, 4))
-                ax.plot(eta_vals, h_vals, 'b-', linewidth=2, label='h(η) = η²(3-2η)')
-                ax.plot([0, 1], [0, 1], 'k--', alpha=0.3, label='y = η')
-                ax.set_xlabel('η')
-                ax.set_ylabel('h(η)')
-                ax.set_title('Standard Moelans Interpolation')
-                ax.grid(True, alpha=0.3)
-                ax.legend()
-                st.pyplot(fig_interp)
     
     # =====================
-    # MICROSTRUCTURE TAB
+    # RESULTS TAB
     # =====================
-    with tab2:
-        st.header("Microstructure Evolution")
+    with tab3:
+        st.header("Simulation Results and Analysis")
         
         if 'field_history' in st.session_state and st.session_state.field_history['eta_sp']:
-            # Create animation slider
+            # Step selection
+            st.subheader("Select Simulation Step")
             step_idx = st.slider(
                 "Simulation Step", 
                 0, 
@@ -991,28 +1090,39 @@ def main():
             step_num = st.session_state.field_history['step_indices'][step_idx]
             eta_sp = st.session_state.field_history['eta_sp'][step_idx]
             c = st.session_state.field_history['c'][step_idx]
+            etas = st.session_state.etas  # Grains remain inert
+            
+            # Create composite visualization
+            composite_grain, grain_ids = create_composite_microstructure(etas, eta_sp)
+            
+            # Display results
+            st.subheader(f"Results at Step {step_num}")
             
             col1, col2 = st.columns(2)
             
             with col1:
-                st.subheader(f"Microstructure at Step {step_num}")
-                fig_micro = create_microstructure_plot(
-                    st.session_state.etas, 
-                    eta_sp,
-                    show_grains=True,
-                    show_substrate=True
-                )
+                st.markdown("**Composite Microstructure**")
+                fig_micro, ax = plt.subplots(figsize=(8, 6))
+                
+                grain_colors = ['black'] + [plt.cm.tab20(i) for i in range(params['n_grains'])]
+                grain_cmap = ListedColormap(grain_colors[:params['n_grains']+1])
+                
+                im = ax.imshow(grain_ids.T, cmap=grain_cmap, origin='lower')
+                ax.set_title(f'Composite Microstructure (Step {step_num})')
+                ax.set_xlabel('X')
+                ax.set_ylabel('Y')
+                plt.colorbar(im, ax=ax, label='Phase ID')
                 st.pyplot(fig_micro)
             
             with col2:
-                st.subheader(f"Substrate Phase at Step {step_num}")
-                fig_substrate, ax = plt.subplots(figsize=(8, 6))
+                st.markdown("**Substrate Phase Field**")
+                fig_sub, ax = plt.subplots(figsize=(8, 6))
                 im = ax.imshow(eta_sp.T, cmap='Blues', origin='lower', vmin=0, vmax=1)
-                ax.set_title(f'Substrate Phase Field (Step {step_num})')
+                ax.set_title(f'Substrate Phase (Step {step_num})')
                 ax.set_xlabel('X')
                 ax.set_ylabel('Y')
                 plt.colorbar(im, ax=ax, label='η_sp')
-                st.pyplot(fig_substrate)
+                st.pyplot(fig_sub)
             
             # GB penetration analysis
             st.subheader("Grain Boundary Penetration Analysis")
@@ -1023,13 +1133,13 @@ def main():
             fig_analysis, axes = plt.subplots(1, 3, figsize=(15, 4))
             
             # GB indicator
-            im1 = axes[0].imshow(gb_indicator.T, cmap='viridis', origin='lower')
+            im1 = axes[0].imshow(gb_indicator.T, cmap='viridis', origin='lower', vmin=0, vmax=1)
             axes[0].set_title('Grain Boundary Indicator')
             plt.colorbar(im1, ax=axes[0])
             
             # Penetration field
-            im2 = axes[1].imshow(penetration.T, cmap='hot', origin='lower')
-            axes[1].set_title('GB Penetration')
+            im2 = axes[1].imshow(penetration.T, cmap='hot', origin='lower', vmin=0, vmax=1)
+            axes[1].set_title('GB Penetration Field')
             plt.colorbar(im2, ax=axes[1])
             
             # Cross-section
@@ -1044,160 +1154,60 @@ def main():
             
             plt.tight_layout()
             st.pyplot(fig_analysis)
-        
-        else:
-            st.info("Run the simulation first to view microstructure evolution")
-    
-    # =====================
-    # INTERPOLATION TAB
-    # =====================
-    with tab3:
-        st.header("Moelans Interpolation Functions")
-        
-        st.markdown("""
-        ### Moelans Interpolation Functions for Multi-Phase Systems
-        
-        The Moelans interpolation functions ensure proper coupling between multiple order parameters in phase-field models. Two key forms are used:
-        
-        **1. Standard Interpolation (for substrate phase):**
-        $$
-        h(η_{sp}) = η_{sp}^2(3 - 2η_{sp})
-        $$
-        
-        **2. Generalized Interpolation (for multiple grains):**
-        $$
-        h_k = \\frac{η_k^2}{η_k^2 + α\\sum_{j≠k} η_j^2}
-        $$
-        where $α$ is a weighting parameter that controls the interface properties.
-        """)
-        
-        if 'etas' in st.session_state:
-            with st.spinner("Computing interpolation functions..."):
-                fig_interp = create_interpolation_visualization(
-                    st.session_state.etas,
-                    st.session_state.eta_sp
-                )
-                st.pyplot(fig_interp)
-            
-            # Mathematical properties
-            st.subheader("Key Properties")
-            st.markdown("""
-            **Standard Interpolation Properties:**
-            - $h(0) = 0$, $h(1) = 1$ (bounds preserved)
-            - $h'(0) = h'(1) = 0$ (zero derivatives at bounds)
-            - $h(η) + h(1-η) = 1$ (partition of unity)
-            - Monotonic increasing between 0 and 1
-            
-            **Generalized Interpolation Properties:**
-            - $\\sum_k h_k = 1$ (partition of unity)
-            - $h_k = 1$ when $η_k = 1$ and all other $η_j = 0$
-            - Smooth transition between phases
-            - Controls interface width through parameter $α$
-            """)
-        
-        else:
-            st.info("Run the simulation first to visualize interpolation functions")
-    
-    # =====================
-    # RESULTS TAB
-    # =====================
-    with tab4:
-        st.header("Simulation Results and Export")
-        
-        if 'field_history' in st.session_state and st.session_state.field_history['eta_sp']:
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                # Energy evolution
-                st.subheader("Energy Evolution")
-                fig_energy, ax = plt.subplots(figsize=(8, 5))
-                ax.plot(st.session_state.energy_history, 'b-', linewidth=2)
-                ax.set_xlabel('Simulation Step')
-                ax.set_ylabel('Free Energy Density')
-                ax.set_title('Free Energy Evolution')
-                ax.grid(True, alpha=0.3)
-                st.pyplot(fig_energy)
-            
-            with col2:
-                # Penetration depth analysis
-                st.subheader("Penetration Depth Analysis")
-                
-                # Calculate penetration depth over time
-                penetration_depths = []
-                for eta_sp in st.session_state.field_history['eta_sp']:
-                    # Find the rightmost point where substrate > 0.5
-                    max_x = 0
-                    for x in range(params['grid_size']):
-                        if np.any(eta_sp[x, :] > 0.5):
-                            max_x = x
-                    penetration_depths.append(max_x)
-                
-                fig_depth, ax = plt.subplots(figsize=(8, 5))
-                steps = st.session_state.field_history['step_indices']
-                ax.plot(steps, penetration_depths, 'g-', linewidth=2, marker='o')
-                ax.set_xlabel('Simulation Step')
-                ax.set_ylabel('Penetration Depth (grid units)')
-                ax.set_title('Substrate Penetration Depth vs Time')
-                ax.grid(True, alpha=0.3)
-                st.pyplot(fig_depth)
             
             # Export section
             st.subheader("Export Simulation Data")
             
-            export_col1, export_col2 = st.columns(2)
+            if st.button("Export as NumPy Arrays", type="primary"):
+                with st.spinner("Preparing export..."):
+                    export_data = {
+                        'parameters': params,
+                        'etas': np.array(st.session_state.etas),  # Inert grains
+                        'eta_sp_history': np.array(st.session_state.field_history['eta_sp']),
+                        'c_history': np.array(st.session_state.field_history['c']),
+                        'gb_indicator_history': np.array(st.session_state.field_history['gb_indicator']),
+                        'step_indices': np.array(st.session_state.field_history['step_indices']),
+                        'energy_history': np.array(st.session_state.energy_history)
+                    }
+                    
+                    # Save to buffer
+                    buf = BytesIO()
+                    np.savez_compressed(buf, **export_data)
+                    buf.seek(0)
+                    
+                    st.download_button(
+                        label="Download Simulation Data",
+                        data=buf.getvalue(),
+                        file_name="intergranular_penetration_data.npz",
+                        mime="application/octet-stream"
+                    )
             
-            with export_col1:
-                if st.button("Export as NumPy Arrays", type="primary"):
-                    with st.spinner("Preparing NumPy export..."):
-                        export_data = {
-                            'parameters': params,
-                            'etas': np.array(st.session_state.field_history['etas']),
-                            'eta_sp': np.array(st.session_state.field_history['eta_sp']),
-                            'c': np.array(st.session_state.field_history['c']),
-                            'gb_indicator': np.array(st.session_state.field_history['gb_indicator']),
-                            'step_indices': np.array(st.session_state.field_history['step_indices']),
-                            'energy_history': np.array(st.session_state.energy_history)
-                        }
-                        
-                        # Save to buffer
-                        buf = BytesIO()
-                        np.savez_compressed(buf, **export_data)
-                        buf.seek(0)
-                        
-                        st.download_button(
-                            label="Download NumPy Data",
-                            data=buf.getvalue(),
-                            file_name="intergranular_penetration_data.npz",
-                            mime="application/octet-stream"
-                        )
+            st.info("""
+            **Export Data Contents:**
+            - `parameters`: Simulation parameters dictionary
+            - `etas`: Inert grain structure (n_grains, nx, ny)
+            - `eta_sp_history`: Substrate phase evolution over time
+            - `c_history`: Concentration field evolution
+            - `gb_indicator_history`: Grain boundary indicator evolution
+            - `step_indices`: Corresponding simulation steps
+            - `energy_history`: Free energy evolution
             
-            with export_col2:
-                st.markdown("""
-                **Export Contents:**
-                - `parameters`: Simulation parameters dictionary
-                - `etas`: Grain order parameters over time (steps, n_grains, nx, ny)
-                - `eta_sp`: Substrate phase over time (steps, nx, ny)
-                - `c`: Concentration field over time (steps, nx, ny)
-                - `gb_indicator`: Grain boundary indicator over time (steps, nx, ny)
-                - `step_indices`: Corresponding simulation steps
-                - `energy_history`: Free energy evolution
-                
-                **To load in Python:**
-                ```python
-                import numpy as np
-                data = np.load('intergranular_penetration_data.npz')
-                params = data['parameters'].item()
-                eta_sp = data['eta_sp']
-                ```
-                """)
+            This data can be loaded in Python for further analysis:
+            ```python
+            import numpy as np
+            data = np.load('intergranular_penetration_data.npz')
+            params = data['parameters'].item()
+            eta_sp_history = data['eta_sp_history']
+            ```
+            """)
         
         else:
-            st.info("Run the simulation first to access results and export options")
+            st.info("Run the simulation first to view results and export data")
     
     # =====================
     # THEORY TAB
     # =====================
-    with tab5:
+    with tab4:
         st.header("Theoretical Foundation")
         
         st.markdown("""
@@ -1220,9 +1230,10 @@ def main():
           - Mobility enhancement: Higher diffusivity along GBs
         
         **3. Moelans Interpolation Functions:**
-        - Ensure proper partition of unity between phases
-        - Control interface properties and width
-        - Enable multi-phase coupling without spurious phases
+        - **Standard form**: $h(η_{sp}) = η_{sp}^2(3 - 2η_{sp})$ for substrate phase
+        - **Generalized form**: $h_k = \\frac{η_k^2}{η_k^2 + α\\sum_{j≠k} η_j^2}$ for grain phases
+        - Ensures partition of unity and proper interface properties
+        - Controls interface width through parameter $α$
         
         ### Mathematical Formulation
         
@@ -1260,17 +1271,7 @@ def main():
         \\mathcal{I}_{GB} = \\sum_{i<j}\\eta_i^2\\eta_j^2
         $$
         
-        This function peaks at grain boundaries (where multiple η_i are non-zero) and is zero within grain interiors.
-        
-        ### Numerical Implementation
-        
-        - **Spatial Discretization**: Finite differences on uniform grid
-        - **Time Integration**: Explicit Euler method
-        - **Boundary Conditions**:
-          - Left boundary (x=0): Fixed substrate phase (η_sp=1) and concentration (c=1)
-          - Right boundary (x=L): Fixed matrix phase (η_sp=0) and concentration (c=c_∞)
-          - Periodic boundaries in y-direction
-        - **Performance**: Numba JIT compilation for critical functions
+        This function peaks at grain boundaries (where multiple $η_i$ are non-zero) and is zero within grain interiors.
         """)
         
         # Parameter guide
@@ -1290,8 +1291,6 @@ def main():
         for param, explanation in params_explanation.items():
             with st.expander(param):
                 st.markdown(explanation)
-        
-      
     
     # Footer
     st.markdown("---")
